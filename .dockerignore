@@ -1,0 +1,53 @@
+# Python virtual environment
+venv/
+env/
+ENV/
+.env
+.venv/
+
+# Python cache files
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.Python
+*.py[cod]
+
+# Development and IDE files
+.git
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test coverage and reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.pytest_cache/
+
+# Documentation
+docs/
+*.md
+README*
+
+# Local development files
+*.log
+logs/
+local_settings.py
+
+# Docker related
+Dockerfile
+docker-compose.yml
+.docker/
+
+# Database
+*.sqlite3
+
