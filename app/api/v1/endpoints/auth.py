@@ -9,9 +9,10 @@ from app.core.security import create_access_token, verify_token
 from app.core.config import settings
 from app.database import get_db
 from app.schemas.user import UserCreate, User, Token, UserGoogle
-from app.models.user import User
+from app.models.user import User as UserModel
 from app.services import auth_service
 from app.core.rate_limit import RateLimiter
+from app.core.deps import get_current_user
 
 # Initialize router and OAuth2 scheme
 router = APIRouter()
@@ -42,7 +43,13 @@ def register(*, request: Request, db: Session = Depends(get_db), user_in: UserCr
     # Here you would normally send an email with the verification link
     # For development, we return the token in the response
     return {
-        "user": user,
+        "id": user.id,
+        "email": user.email,
+        "full_name": user.full_name,
+        "is_active": user.is_active,
+        "is_superuser": user.is_superuser,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
         "verification_token": verification_token
     }
 
@@ -109,12 +116,20 @@ async def google_auth(*, db: Session = Depends(get_db), token: str) -> Any:
         return {"access_token": token, "token_type": "bearer"}
 
 @router.get("/me", response_model=User)
-def read_current_user( current_user: Annotated[User, Depends(get_current_user)]) -> User:
+def read_current_user(current_user: Annotated[UserModel, Depends(get_current_user)]) -> Any:
     """
     Get details of currently logged-in user.
     This endpoint demonstrates how to protect routes with JWT authentication.
     """
-    return current_user
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "is_active": current_user.is_active,
+        "is_superuser": current_user.is_superuser,
+        "created_at": current_user.created_at,
+        "updated_at": current_user.updated_at
+    }
 
 @router.post("/verify-email")
 async def verify_email(token: str, db: Session = Depends(get_db)):

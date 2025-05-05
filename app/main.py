@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
-from app.api.v1.endpoints import auth
+from app.api.v1.endpoints import auth, passwords, session
 from app.database import engine, Base
 
 # Create all database tables
@@ -32,6 +32,18 @@ app.include_router(
     auth.router,
     prefix=f"{settings.API_V1_STR}/auth",
     tags=["authentication"]
+)
+
+app.include_router(
+    passwords.router,
+    prefix=f"{settings.API_V1_STR}/passwords",
+    tags=["passwords"]
+)
+
+app.include_router(
+    session.router,
+    prefix=f"{settings.API_V1_STR}/sessions",
+    tags=["sessions"]
 )
 
 # Health check endpoint
