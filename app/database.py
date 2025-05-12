@@ -1,19 +1,28 @@
-from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
+import re
 
-engine = create_engine(settings.DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+db_url = settings.DATABASE_URL
+db_url = re.sub(r'\?sslmode=require', '', db_url)
+db_url = db_url.replace('postgresql://', 'postgresql+asyncpg://')
+
+engine = create_async_engine(
+    db_url,
+    echo=False,
+    connect_args={"ssl": True} if "neon.tech" in db_url else {}
+)
+
+SessionLocal = sessionmaker(
+    engine, class_=AsyncSession, expire_on_commit=False
+)
+
 Base = declarative_base()
 
-def get_db():
-    """
-    Creates a database session for each request and ensures it's closed afterward.
-    This function is used as a dependency in FastAPI endpoints.
-    """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+async def get_db():
+    async with SessionLocal() as db:
+        try:
+            yield db
+        finally:
+            await db.close()

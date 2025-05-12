@@ -52,8 +52,8 @@ docker-compose up --build
 
 For local development:
 ```bash
-python -m venv venv
-source venv/bin/activate  # For Windows use: .\venv\Scripts\activate
+conda create -n bluescan python=3.9
+conda activate bluescan
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```

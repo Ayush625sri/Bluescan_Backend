@@ -1,12 +1,65 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
 venv/
-*.env
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment variables
+.env
+.env.*
+!.env.example
 
 # IDE
 .vscode/
 .idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
 
 # Docker
 .docker/
+docker-compose.override.yml
+
+# Database
+*.sqlite3
+*.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+nosetests.xml
+coverage.xml
+
+# Alembic
+alembic.ini.example
+
+# OS specific
+.DS_Store
+Thumbs.db
