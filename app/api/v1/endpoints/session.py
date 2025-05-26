@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException, status
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException,  status, File, UploadFile
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
@@ -9,6 +9,7 @@ from app.database import get_db
 from app.core.deps import get_current_user
 from app.models.user import User
 from app.services import session_service
+from app.services import image_service
 
 import asyncio
 import traceback
@@ -18,7 +19,19 @@ from loguru import logger
 router = APIRouter()
 
 # Dictionary to store active websocket connections
+# active_connections: Dict[int, List[WebSocket]] = {}
 active_connections: Dict[int, List[WebSocket]] = {}
+device_connections: Dict[int, Dict[str, Dict[str, Any]]] = {}  # user_id -> device_id -> connection_info
+
+class DeviceConnection:
+    def __init__(self, websocket: WebSocket, device_id: str, device_data: Dict[str, Any]):
+        self.websocket = websocket
+        self.device_id = device_id
+        self.device_name = device_data.get("device_name", "Unknown Device")
+        self.device_type = device_data.get("device_type", "unknown")
+        self.connected_at = datetime.utcnow()
+        self.last_ping = datetime.utcnow()
+        self.is_active = True
 
 @router.websocket("/ws/{user_id}")
 async def websocket_endpoint(
@@ -27,14 +40,12 @@ async def websocket_endpoint(
     token: str,
     db: Session = Depends(get_db)
 ):
-    """
-    WebSocket endpoint for real-time session management and WebRTC signaling.
-    Authenticates the user and keeps track of active connections.
-    """
-    # Verify token and get user
+    """Enhanced WebSocket endpoint with real device tracking."""
     try:
+        # Verify token and get user
         user = session_service.verify_token_ws(db, token, user_id)
         if not user:
+            logger.error("WebSocket authentication failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
     except Exception as e:
@@ -42,87 +53,277 @@ async def websocket_endpoint(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     
-    # Accept the websocket connection
     await websocket.accept()
     logger.info(f"WebSocket connection established for user {user_id}")
     
-    # Add to active connections
-    if user_id not in active_connections:
-        active_connections[user_id] = []
-    active_connections[user_id].append(websocket)
+    device_connection = None
+    device_id = None
     
-    # Register device if needed
     try:
+        # Wait for device registration message
         device_info = await websocket.receive_text()
         device_data = json.loads(device_info)
-        device_id = session_service.register_device(db, user, device_data)
         
-        # Send initial session data
-        session_data = session_service.get_user_sessions(db, user_id)
-        await websocket.send_text(json.dumps({"type": "sessions", "data": session_data}))
+        logger.info(f"Received device registration: {device_data}")
         
-        # Notify other devices of this device
-        if user_id in active_connections:
-            for conn in active_connections[user_id]:
-                if conn != websocket:
-                    await conn.send_text(json.dumps({
-                        "type": "device_connected",
-                        "device_id": device_id,
-                        "device_name": device_data.get("device_name", "Unknown Device")
-                    }))
+        # Validate device data
+        if not device_data.get("device_id") or not device_data.get("device_name"):
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "device_id and device_name are required"
+            }))
+            return
+        
+        device_id = device_data["device_id"]
+        
+        # Register device in database
+        registered_device_id = session_service.register_device_sync(db, user, device_data)
+        
+        # Create device connection tracking
+        device_connection = DeviceConnection(websocket, device_id, device_data)
+        
+        # Add to tracking dictionaries
+        if user_id not in active_connections:
+            active_connections[user_id] = []
+        active_connections[user_id].append(websocket)
+        
+        if user_id not in device_connections:
+            device_connections[user_id] = {}
+        
+        # Handle multiple connections from same device
+        if device_id in device_connections[user_id]:
+            # Close previous connection from same device
+            old_connection = device_connections[user_id][device_id]
+            try:
+                await old_connection["websocket"].close(code=1000, reason="New connection from same device")
+            except:
+                pass
+        
+        device_connections[user_id][device_id] = {
+            "websocket": websocket,
+            "device_data": device_data,
+            "connected_at": device_connection.connected_at.isoformat(),
+            "last_ping": device_connection.last_ping.isoformat(),
+            "is_active": True
+        }
+        
+        logger.info(f"Device {device_id} registered for user {user_id}")
+        
+        # Send confirmation with real device info
+        await websocket.send_text(json.dumps({
+            "type": "device_registered",
+            "device_id": device_id,
+            "status": "success",
+            "message": "Device registered successfully",
+            "registered_at": device_connection.connected_at.isoformat()
+        }))
+        
+        # Send current devices list to this device
+        current_devices = session_service.get_real_online_devices_for_user(user_id)
+        await websocket.send_text(json.dumps({
+            "type": "devices_list",
+            "devices": current_devices
+        }))
+        
+        # Notify other devices of this new device
+        await notify_other_devices(user_id, device_id, {
+            "type": "device_connected",
+            "device_id": device_id,
+            "device_name": device_data.get("device_name"),
+            "device_type": device_data.get("device_type"),
+            "connected_at": device_connection.connected_at.isoformat()
+        })
         
         # Main WebSocket loop
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            message_type = message.get("type", "unknown")
-            
-            # Log message type but not full content for privacy
-            logger.debug(f"Received {message_type} message from user {user_id}")
-            
-            # Handle different message types
-            if message_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-            
-            elif message_type == "session_request":
-                await handle_session_request(websocket, user, user_id, message, device_id)
+            try:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                message_type = message.get("type", "unknown")
                 
-            elif message_type == "session_response":
-                await handle_session_response(websocket, user, user_id, message, device_id)
+                logger.debug(f"Received {message_type} from device {device_id} (user {user_id})")
                 
-            elif message_type == "webrtc_signal":
-                await handle_webrtc_signal(websocket, user, user_id, message)
+                # Update last ping time
+                device_connections[user_id][device_id]["last_ping"] = datetime.utcnow().isoformat()
                 
-            elif message_type == "session_end":
-                await handle_session_end(websocket, user, user_id, message, db)
-            
-            elif message_type == "ice_candidate":
-                await handle_ice_candidate(websocket, user, user_id, message)
+                if message_type == "ping":
+                    await websocket.send_text(json.dumps({
+                        "type": "pong",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }))
+                
+                elif message_type == "get_devices":
+                    devices = session_service.get_real_online_devices_for_user(user_id)
+                    await websocket.send_text(json.dumps({
+                        "type": "devices_list",
+                        "devices": devices
+                    }))
+                
+                elif message_type == "session_request":
+                    await handle_real_session_request(websocket, user, user_id, message, device_id)
+                
+                elif message_type == "session_response":
+                    await handle_real_session_response(websocket, user, user_id, message, device_id)
+                
+                elif message_type == "webrtc_signal":
+                    await handle_real_webrtc_signal(websocket, user, user_id, message, device_id)
+                
+                elif message_type == "ice_candidate":
+                    await handle_real_ice_candidate(websocket, user, user_id, message, device_id)
+                
+                elif message_type == "session_end":
+                    await handle_real_session_end(websocket, user, user_id, message, device_id, db)
+                
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"Unknown message type: {message_type}"
+                    }))
+                    
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON received from device {device_id}")
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "Invalid JSON format"
+                }))
                 
     except WebSocketDisconnect:
-        # Remove connection on disconnect
         logger.info(f"WebSocket disconnected for user {user_id}, device {device_id}")
-        active_connections[user_id].remove(websocket)
-        if not active_connections[user_id]:
-            del active_connections[user_id]
-        
-        # Update device status
-        session_service.update_device_status(db, user_id, device_id, False)
-        
-        # Notify other devices of this device disconnect
-        if user_id in active_connections:
-            for conn in active_connections[user_id]:
-                await conn.send_text(json.dumps({
-                    "type": "device_disconnected",
-                    "device_id": device_id
-                }))
     except Exception as e:
-        logger.error(f"WebSocket error for user {user_id}: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"WebSocket error for user {user_id}, device {device_id}: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+    finally:
+        # Cleanup connections
+        await cleanup_device_connection(user_id, device_id, websocket, db)
+
+async def cleanup_device_connection(user_id: int, device_id: str, websocket: WebSocket, db: Session):
+    """Clean up device connection when WebSocket disconnects."""
+    try:
+        # Remove from active connections
         if user_id in active_connections and websocket in active_connections[user_id]:
             active_connections[user_id].remove(websocket)
             if not active_connections[user_id]:
                 del active_connections[user_id]
+        
+        # Remove from device connections
+        if user_id in device_connections and device_id in device_connections[user_id]:
+            del device_connections[user_id][device_id]
+            if not device_connections[user_id]:
+                del device_connections[user_id]
+        
+        # Update device status in database
+        if device_id:
+            session_service.update_device_status_sync(db, user_id, device_id, False)
+        
+        # Notify other devices
+        await notify_other_devices(user_id, device_id, {
+            "type": "device_disconnected",
+            "device_id": device_id,
+            "disconnected_at": datetime.utcnow().isoformat()
+        })
+        
+        logger.info(f"Cleaned up device {device_id} for user {user_id}")
+        
+    except Exception as e:
+        logger.error(f"Error during cleanup: {str(e)}")
+
+async def notify_other_devices(user_id: int, sender_device_id: str, message: Dict[str, Any]):
+    """Send message to all other devices of the same user."""
+    if user_id not in device_connections:
+        return
+    
+    for device_id, connection_info in device_connections[user_id].items():
+        if device_id != sender_device_id:  # Don't send to sender
+            try:
+                websocket = connection_info["websocket"]
+                await websocket.send_text(json.dumps(message))
+            except Exception as e:
+                logger.error(f"Failed to notify device {device_id}: {str(e)}")
+
+async def send_to_specific_device(user_id: int, target_device_id: str, message: Dict[str, Any]):
+    """Send message to a specific device."""
+    if (user_id in device_connections and 
+        target_device_id in device_connections[user_id]):
+        try:
+            websocket = device_connections[user_id][target_device_id]["websocket"]
+            await websocket.send_text(json.dumps(message))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send to device {target_device_id}: {str(e)}")
+    return False
+# @router.websocket("/ws/{user_id}")
+# async def websocket_endpoint(
+#     websocket: WebSocket,
+#     user_id: int,
+#     token: str,
+#     db: Session = Depends(get_db)
+# ):
+#     """WebSocket endpoint for real-time session management."""
+#     try:
+#         # Verify token and get user
+#         user = session_service.verify_token_ws(db, token, user_id)
+#         if not user:
+#             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+#             return
+#     except Exception as e:
+#         logger.error(f"WebSocket authentication error: {str(e)}")
+#         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+#         return
+    
+#     await websocket.accept()
+#     logger.info(f"WebSocket connection established for user {user_id}")
+    
+#     # Add to active connections
+#     if user_id not in active_connections:
+#         active_connections[user_id] = []
+#     active_connections[user_id].append(websocket)
+    
+#     device_id = None
+    
+#     try:
+#         # Wait for device registration message
+#         device_info = await websocket.receive_text()
+#         device_data = json.loads(device_info)
+        
+#         logger.info(f"Received device data: {device_data}")
+        
+#         # Register device in database
+#         device_id = session_service.register_device_sync(db, user, device_data)
+#         logger.info(f"Registered device with ID: {device_id}")
+        
+#         # Send confirmation
+#         await websocket.send_text(json.dumps({
+#             "type": "device_registered",
+#             "device_id": device_id,
+#             "status": "success"
+#         }))
+        
+#         # Send initial session data
+#         session_data = session_service.get_user_sessions(db, user_id)
+#         await websocket.send_text(json.dumps({
+#             "type": "sessions", 
+#             "data": session_data
+#         }))
+        
+#         # Main WebSocket loop
+#         while True:
+#             data = await websocket.receive_text()
+#             message = json.loads(data)
+#             message_type = message.get("type", "unknown")
+            
+#             logger.debug(f"Received {message_type} message from user {user_id}")
+            
+#             if message_type == "ping":
+#                 await websocket.send_text(json.dumps({"type": "pong"}))
+#             # ... handle other message types
+                
+#     except WebSocketDisconnect:
+#         logger.info(f"WebSocket disconnected for user {user_id}")
+#         # Cleanup code...
+#     except Exception as e:
+#         logger.error(f"WebSocket error for user {user_id}: {str(e)}")
+#         # Cleanup code...
 
 @router.get("/webrtc-config", response_model=Dict[str, Any])
 async def get_webrtc_config(
@@ -347,56 +548,98 @@ async def handle_session_end(websocket: WebSocket, user: User, user_id: int, mes
         "session_id": session_id
     }))
    
+# @router.post("/request", response_model=Dict[str, Any])
+# async def create_session_request(
+#     request_data: Dict[str, Any],
+#     current_user: User = Depends(get_current_user),
+#     db: AsyncSession = Depends(get_db)
+# ):
+#     """Create a new session request from web app to mobile app."""
+#     target_user_id = request_data.get("target_user_id")
+    
+#     if not target_user_id:
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail="Target user ID is required"
+#         )
+    
+#     try:
+#         # Create session request record
+#         request_id = await session_service.create_session_request(
+#             db, current_user.id, target_user_id
+#         )
+        
+#         # Notify target user via WebSocket if connected
+#         if target_user_id in active_connections:
+#             notification = {
+#                 "type": "session_request",
+#                 "from_user_id": current_user.id,
+#                 "request_id": request_id,
+#                 "user_name": current_user.full_name
+#             }
+            
+#             for connection in active_connections[target_user_id]:
+#                 await connection.send_text(json.dumps(notification))
+        
+#         return {
+#             "status": "success",
+#             "message": "Session request sent",
+#             "request_id": request_id
+#         }
+#     except HTTPException as e:
+#         raise e
+#     except Exception as e:
+#         # Log the error
+#         import traceback
+#         print(f"Error in create_session_request: {str(e)}")
+#         print(traceback.format_exc())
+        
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail=f"Failed to create session request: {str(e)}"
+#         )
+
 @router.post("/request", response_model=Dict[str, Any])
 async def create_session_request(
-    request_data: Dict[str, Any],
+    request_data: Dict[str, Any],  # Should contain target_device_id
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Create a new session request from web app to mobile app."""
-    target_user_id = request_data.get("target_user_id")
+    """Create session request between user's devices."""
+    target_device_id = request_data.get("target_device_id")
     
-    if not target_user_id:
+    if not target_device_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Target user ID is required"
+            detail="target_device_id is required"
         )
     
-    try:
-        # Create session request record
-        request_id = await session_service.create_session_request(
-            db, current_user.id, target_user_id
-        )
-        
-        # Notify target user via WebSocket if connected
-        if target_user_id in active_connections:
-            notification = {
-                "type": "session_request",
-                "from_user_id": current_user.id,
-                "request_id": request_id,
-                "user_name": current_user.full_name
-            }
-            
-            for connection in active_connections[target_user_id]:
-                await connection.send_text(json.dumps(notification))
-        
-        return {
-            "status": "success",
-            "message": "Session request sent",
-            "request_id": request_id
-        }
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        # Log the error
-        import traceback
-        print(f"Error in create_session_request: {str(e)}")
-        print(traceback.format_exc())
-        
+    # Verify target device belongs to same user
+    device = await session_service.get_device_by_id(db, target_device_id, current_user.id)
+    if not device:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create session request: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Device not found or doesn't belong to user"
         )
+    
+    # Create session request
+    request_id = await session_service.create_device_session_request(
+        db, current_user.id, target_device_id
+    )
+    
+    # Notify target device via WebSocket
+    await notify_device(current_user.id, target_device_id, {
+        "type": "session_request",
+        "request_id": request_id,
+        "from_device_id": request_data.get("from_device_id"),
+        "device_name": request_data.get("device_name", "Unknown Device")
+    })
+    
+    return {
+        "status": "success",
+        "request_id": request_id
+    }
+
 @router.get("/active", response_model=Dict[str, List[Dict[str, Any]]])
 async def get_sessions(
     current_user: User = Depends(get_current_user),
@@ -439,7 +682,7 @@ async def respond_to_session_request(
     
     return result
 
-@router.get("/{session_id}", response_model=Dict[str, Any])
+@router.get("/id/{session_id}", response_model=Dict[str, Any])
 async def get_session_status(
     session_id: str,
     current_user: User = Depends(get_current_user),
@@ -488,3 +731,182 @@ async def update_session_metadata(
     """Update metadata for an active session."""
     result = await session_service.store_session_metadata(db, session_id, metadata)
     return result
+
+@router.get("/devices", response_model=Dict[str, Any])
+async def get_available_devices(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get current user's devices for session requests."""
+    try:
+        # Debug: Print user info
+        logger.info(f"Getting devices for user {current_user.id}")
+        
+        # Get user's devices from database
+        devices = await session_service.get_current_user_devices(db, current_user.id)
+        logger.info(f"Found {len(devices)} devices in database")
+        
+        # Get online status from WebSocket connections
+        online_devices = session_service.get_online_devices_for_user(current_user.id)
+        logger.info(f"Found {len(online_devices)} online devices")
+        
+        # Update online status
+        for device in devices:
+            device["is_online"] = device["device_id"] in online_devices
+        
+        return {
+            "status": "success",
+            "devices": devices,
+            "total_devices": len(devices),
+            "online_devices": len([d for d in devices if d["is_online"]]),
+            "debug_info": {
+                "user_id": current_user.id,
+                "db_devices": len(devices),
+                "websocket_devices": len(online_devices),
+                "websocket_device_ids": online_devices
+            }
+        }
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Error in get_available_devices: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch devices: {str(e)}"
+        )
+
+
+
+@router.post("/{session_id}/images", response_model=Dict[str, Any])
+async def upload_session_image(
+    session_id: str,
+    file: UploadFile = File(...),
+    description: Optional[str] = None,
+    latitude: Optional[str] = None,
+    longitude: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Upload image captured during session."""
+    # Validate session belongs to user
+    session = await session_service.get_session_by_id(db, session_id, current_user.id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Upload image
+    image_info = await image_service.upload_session_image(
+        db, session_id, current_user.id, file, description, latitude, longitude
+    )
+    
+    # Notify other device via WebSocket
+    await notify_partner_device(session_id, current_user.id, {
+        "type": "image_uploaded",
+        "image": image_info
+    })
+    
+    return {"status": "success", "image": image_info}
+
+@router.get("/{session_id}/images", response_model=Dict[str, Any])
+async def get_session_images(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all images from session."""
+    # Verify session access
+    session = await session_service.get_session_by_id(db, session_id, current_user.id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    images = await image_service.get_session_images(db, session_id)
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "images": images
+    }
+    
+@router.get("/{session_id}/summary", response_model=Dict[str, Any])
+async def get_session_summary(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get session summary after ending."""
+    session = await session_service.get_session_by_id(db, session_id, current_user.id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    summary = await session_service.generate_session_summary(db, session_id)
+    
+    return {
+        "status": "success",
+        "summary": summary
+    }
+    
+    
+async def notify_device(user_id: int, target_device_id: str, message: Dict):
+    """Send notification to specific device."""
+    from app.api.v1.endpoints.session import active_device_connections
+    
+    if user_id in active_device_connections:
+        if target_device_id in active_device_connections[user_id]:
+            websocket = active_device_connections[user_id][target_device_id]["websocket"]
+            try:
+                await websocket.send_text(json.dumps(message))
+            except:
+                pass  # Connection might be closed
+
+async def notify_partner_device(session_id: str, user_id: int, message: Dict):
+    """Notify the other device in the session."""
+    # In your case, both devices belong to same user
+    # You'd need to track which device is the "other" one in the session
+    # This is a placeholder - implement based on your session tracking
+    pass
+
+def register_device_sync(db: Session, user: User, device_data: Dict[str, Any]) -> str:
+    """Register a device synchronously for WebSocket usage."""
+    try:
+        from app.models.device import Device
+        import uuid
+        from datetime import datetime
+        
+        device_id = device_data.get("device_id", str(uuid.uuid4()))
+        device_name = device_data.get("device_name", "Unknown Device")
+        device_type = device_data.get("device_type", "other")
+        
+        logger.info(f"Registering device: {device_id}, {device_name}, {device_type}")
+        
+        # Check if device exists
+        existing_device = db.query(Device).filter(
+            Device.user_id == user.id,
+            Device.device_id == device_id
+        ).first()
+        
+        if existing_device:
+            # Update existing device
+            existing_device.is_active = True
+            existing_device.last_active = datetime.utcnow()
+            db.commit()
+            logger.info(f"Updated existing device: {device_id}")
+            return device_id
+        
+        # Create new device
+        new_device = Device(
+            user_id=user.id,
+            device_id=device_id,
+            device_name=device_name,
+            device_type=device_type,
+            is_active=True
+        )
+        db.add(new_device)
+        db.commit()
+        
+        logger.info(f"Created new device: {device_id}")
+        return device_id
+        
+    except Exception as e:
+        logger.error(f"Error registering device: {str(e)}")
+        db.rollback()
+        return str(uuid.uuid4())  # Return fallback ID

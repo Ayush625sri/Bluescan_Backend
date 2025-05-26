@@ -563,3 +563,109 @@ async def store_session_metadata(db: AsyncSession, session_id: str, metadata: Di
         "message": "Session metadata updated",
         "session_id": session_id
     }
+
+async def get_current_user_devices(db: AsyncSession, user_id: int) -> List[Dict[str, Any]]:
+    """Get all devices belonging to the current user."""
+    try:
+        from app.models.device import Device
+        from sqlalchemy import select
+        
+        logger.info(f"Querying devices for user_id: {user_id}")
+        
+        result = await db.execute(
+            select(Device).where(Device.user_id == user_id)
+            .order_by(Device.last_active.desc())
+        )
+        devices = result.scalars().all()
+        
+        logger.info(f"Query returned {len(devices)} devices")
+        
+        device_list = []
+        for device in devices:
+            device_dict = {
+                "device_id": device.device_id,
+                "device_name": device.device_name,
+                "device_type": device.device_type,
+                "is_active": device.is_active,
+                "last_active": device.last_active.isoformat() if device.last_active else None,
+                "created_at": device.created_at.isoformat() if device.created_at else None,
+                "is_online": False  # Will be updated by caller
+            }
+            device_list.append(device_dict)
+            logger.info(f"Device: {device_dict}")
+        
+        return device_list
+        
+    except Exception as e:
+        logger.error(f"Error in get_current_user_devices: {str(e)}")
+        raise
+
+def get_online_devices_for_user(user_id: int) -> List[str]:
+    """Get list of online device IDs for user from WebSocket connections."""
+    try:
+        from app.api.v1.endpoints.session import active_connections
+        
+        logger.info(f"Checking online devices for user {user_id}")
+        logger.info(f"Active connections: {list(active_connections.keys())}")
+        
+        if user_id not in active_connections:
+            logger.info(f"User {user_id} not in active connections")
+            return []
+        
+        connections = active_connections[user_id]
+        logger.info(f"User {user_id} has {len(connections)} connections")
+        
+        # For now, return mock device IDs based on connection count
+        # In real implementation, you'd track actual device IDs per connection
+        device_ids = [f"connection_{i}" for i in range(len(connections))]
+        
+        logger.info(f"Generated device IDs: {device_ids}")
+        return device_ids
+        
+    except Exception as e:
+        logger.error(f"Error in get_online_devices_for_user: {str(e)}")
+        return []
+    
+async def get_device_by_id(db: AsyncSession, device_id: str, user_id: int) -> Optional[Dict]:
+    """Get device info if it belongs to user."""
+    from app.models.device import Device
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.user_id == user_id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        return None
+    
+    return {
+        "device_id": device.device_id,
+        "device_name": device.device_name,
+        "device_type": device.device_type,
+        "user_id": device.user_id
+    }
+
+async def create_device_session_request(
+    db: AsyncSession, 
+    user_id: int, 
+    target_device_id: str
+) -> str:
+    """Create session request between user's devices."""
+    from app.models.session import SessionRequest
+    
+    request_id = str(uuid.uuid4())
+    
+    new_request = SessionRequest(
+        request_id=request_id,
+        from_user_id=user_id,
+        to_user_id=user_id,  # Same user
+        status="pending"
+    )
+    
+    db.add(new_request)
+    await db.commit()
+    
+    return request_id
