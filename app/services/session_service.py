@@ -10,19 +10,36 @@ from loguru import logger
 from app.models.user import User
 from app.core.security import verify_token
 
-async def verify_token_ws(db: AsyncSession, token: str, user_id: int) -> Optional[User]:
-    """
-    Verifies a JWT token for WebSocket connections.
-    """
-    email = verify_token(token)
-    if not email:
-        logger.info("email not found")
-        return None
-    logger.info("User email found, returning User")
+# async def verify_token_ws(db: AsyncSession, token: str, user_id: int) -> Optional[User]:
+#     """
+#     Verifies a JWT token for WebSocket connections.
+#     """
+#     email = verify_token(token)
+#     if not email:
+#         logger.info("email not found")
+#         return None
+#     logger.info("User email found, returning User")
     
-    result = await db.execute(select(User).where(User.email == email, User.id == user_id))
-    user = result.scalars().first()
-    return user
+#     result = await db.execute(select(User).where(User.email == email, User.id == user_id))
+#     user = result.scalars().first()
+#     return user
+def verify_token_ws(db: Session, token: str, user_id: int) -> Optional[User]:
+    """Verify JWT token for WebSocket connections - SYNC version."""
+    try:
+        email = verify_token(token)
+        if not email:
+            logger.info("Token verification failed")
+            return None
+        
+        logger.info(f"Token verified for email: {email}")
+        
+        # Use synchronous query
+        user = db.query(User).filter(User.email == email, User.id == user_id).first()
+        return user
+        
+    except Exception as e:
+        logger.error(f"Error in verify_token_ws: {str(e)}")
+        return None
 
 async def register_device(db: AsyncSession, user: User, device_data: Dict[str, Any]) -> str:
     """
@@ -625,28 +642,6 @@ def get_online_devices_for_user(user_id: int) -> List[str]:
     except Exception as e:
         logger.error(f"Error in get_online_devices_for_user: {str(e)}")
         return []
-    
-async def get_device_by_id(db: AsyncSession, device_id: str, user_id: int) -> Optional[Dict]:
-    """Get device info if it belongs to user."""
-    from app.models.device import Device
-    
-    result = await db.execute(
-        select(Device).where(
-            Device.device_id == device_id,
-            Device.user_id == user_id
-        )
-    )
-    device = result.scalars().first()
-    
-    if not device:
-        return None
-    
-    return {
-        "device_id": device.device_id,
-        "device_name": device.device_name,
-        "device_type": device.device_type,
-        "user_id": device.user_id
-    }
 
 async def create_device_session_request(
     db: AsyncSession, 
@@ -669,3 +664,245 @@ async def create_device_session_request(
     await db.commit()
     
     return request_id
+
+
+def get_real_online_devices_for_user(user_id: int) -> List[Dict[str, Any]]:
+    """Get real online devices with actual device IDs and info."""
+    try:
+        from app.api.v1.endpoints.session import device_connections
+        
+        logger.info(f"Getting real online devices for user {user_id}")
+        
+        if user_id not in device_connections:
+            logger.info(f"User {user_id} has no active device connections")
+            return []
+        
+        online_devices = []
+        for device_id, connection_info in device_connections[user_id].items():
+            device_data = connection_info["device_data"]
+            connected_at = connection_info["connected_at"]
+            last_ping = connection_info["last_ping"]
+            
+            online_devices.append({
+                "device_id": device_id,
+                "device_name": device_data.get("device_name", "Unknown Device"),
+                "device_type": device_data.get("device_type", "unknown"),
+                "is_online": True,
+                "connected_at": connected_at,
+                "last_ping": last_ping,
+                "connection_quality": "good"  # You can implement real quality checking
+            })
+        
+        logger.info(f"Found {len(online_devices)} real online devices")
+        return online_devices
+        
+    except Exception as e:
+        logger.error(f"Error getting real online devices: {str(e)}")
+        return []
+
+async def get_current_user_devices_enhanced(db: AsyncSession, user_id: int) -> List[Dict[str, Any]]:
+    """Get user devices with real online status and enhanced info."""
+    try:
+        from app.models.device import Device
+        from sqlalchemy import select
+        
+        logger.info(f"Getting enhanced devices for user_id: {user_id}")
+        
+        # Get devices from database
+        result = await db.execute(
+            select(Device).where(Device.user_id == user_id)
+            .order_by(Device.last_active.desc())
+        )
+        devices = result.scalars().all()
+        
+        logger.info(f"Found {len(devices)} devices in database")
+        
+        # Get real online devices
+        online_devices = get_real_online_devices_for_user(user_id)
+        online_device_ids = {d["device_id"] for d in online_devices}
+        
+        device_list = []
+        for device in devices:
+            # Find matching online device info
+            online_info = next(
+                (od for od in online_devices if od["device_id"] == device.device_id), 
+                None
+            )
+            
+            device_dict = {
+                "device_id": device.device_id,
+                "device_name": device.device_name,
+                "device_type": device.device_type,
+                "is_active": device.is_active,
+                "is_online": device.device_id in online_device_ids,
+                "last_active": device.last_active.isoformat() if device.last_active else None,
+                "created_at": device.created_at.isoformat() if hasattr(device, 'created_at') and device.created_at else None,
+                "online_info": online_info if online_info else None
+            }
+            device_list.append(device_dict)
+            logger.info(f"Enhanced device: {device_dict}")
+        
+        return device_list
+        
+    except Exception as e:
+        logger.error(f"Error in get_current_user_devices_enhanced: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+async def create_real_session_request(
+    db: AsyncSession, 
+    user_id: int, 
+    from_device_id: str,
+    target_device_id: str
+) -> str:
+    """Create session request between specific devices."""
+    try:
+        from app.models.session import SessionRequest
+        
+        # Verify both devices belong to the user
+        from_device = await get_device_by_id(db, from_device_id, user_id)
+        target_device = await get_device_by_id(db, target_device_id, user_id)
+        
+        if not from_device or not target_device:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="One or both devices not found"
+            )
+        
+        request_id = str(uuid.uuid4())
+        
+        new_request = SessionRequest(
+            request_id=request_id,
+            from_user_id=user_id,
+            to_user_id=user_id,  # Same user, different devices
+            status="pending"
+        )
+        
+        db.add(new_request)
+        await db.commit()
+        
+        logger.info(f"Created session request {request_id} from {from_device_id} to {target_device_id}")
+        
+        return request_id
+        
+    except Exception as e:
+        logger.error(f"Error creating real session request: {str(e)}")
+        raise
+
+async def get_device_by_id(db: AsyncSession, device_id: str, user_id: int) -> Optional[Dict]:
+    """Get device info if it belongs to user."""
+    try:
+        from app.models.device import Device
+        from sqlalchemy import select
+        
+        result = await db.execute(
+            select(Device).where(
+                Device.device_id == device_id,
+                Device.user_id == user_id
+            )
+        )
+        device = result.scalars().first()
+        
+        if not device:
+            return None
+        
+        return {
+            "device_id": device.device_id,
+            "device_name": device.device_name,
+            "device_type": device.device_type,
+            "user_id": device.user_id,
+            "is_active": device.is_active,
+            "last_active": device.last_active
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting device by ID: {str(e)}")
+        return None
+
+def get_device_connection_info(user_id: int, device_id: str) -> Optional[Dict[str, Any]]:
+    """Get real-time connection info for a specific device."""
+    try:
+        from app.api.v1.endpoints.session import device_connections
+        
+        if (user_id in device_connections and 
+            device_id in device_connections[user_id]):
+            return device_connections[user_id][device_id]
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error getting device connection info: {str(e)}")
+        return None
+
+def register_device_sync(db: Session, user: User, device_data: Dict[str, Any]) -> str:
+    """Register a device synchronously for WebSocket usage."""
+    try:
+        from app.models.device import Device
+        import uuid
+        from datetime import datetime
+        
+        device_id = device_data.get("device_id", str(uuid.uuid4()))
+        device_name = device_data.get("device_name", "Unknown Device")
+        device_type = device_data.get("device_type", "other")
+        
+        logger.info(f"Registering device: {device_id}, {device_name}, {device_type} for user {user.id}")
+        
+        # Check if device exists
+        existing_device = db.query(Device).filter(
+            Device.user_id == user.id,
+            Device.device_id == device_id
+        ).first()
+        
+        if existing_device:
+            existing_device.is_active = True
+            existing_device.last_active = datetime.utcnow()
+            db.commit()
+            logger.info(f"Updated existing device: {device_id}")
+            return device_id
+        
+        # Create new device
+        new_device = Device(
+            user_id=user.id,
+            device_id=device_id,
+            device_name=device_name,
+            device_type=device_type,
+            is_active=True
+        )
+        db.add(new_device)
+        db.commit()
+        
+        logger.info(f"Created new device: {device_id}")
+        return device_id
+        
+    except Exception as e:
+        logger.error(f"Error registering device: {str(e)}")
+        db.rollback()
+        return str(uuid.uuid4())
+
+def update_device_status_sync(db: Session, user_id: int, device_id: str, is_active: bool) -> None:
+    """Update device status synchronously."""
+    try:
+        from app.models.device import Device
+        from datetime import datetime
+        
+        device = db.query(Device).filter(
+            Device.user_id == user_id,
+            Device.device_id == device_id
+        ).first()
+        
+        if device:
+            device.is_active = is_active
+            device.last_active = datetime.utcnow()
+            db.commit()
+            logger.info(f"Updated device {device_id} status to {is_active}")
+        
+    except Exception as e:
+        logger.error(f"Error updating device status: {str(e)}")
+        db.rollback()
+
+
+

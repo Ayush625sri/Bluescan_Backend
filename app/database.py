@@ -26,3 +26,24 @@ async def get_db():
             yield db
         finally:
             await db.close()
+            
+def get_db_sync():
+    """Synchronous database session for WebSocket usage."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    import re
+    
+    db_url = settings.get_database_url
+    db_url = re.sub(r'\?sslmode=require', '', db_url)
+    # Remove asyncpg for sync connection
+    db_url = db_url.replace('postgresql+asyncpg://', 'postgresql://')
+    
+    sync_engine = create_engine(db_url)
+    SyncSessionLocal = sessionmaker(bind=sync_engine)
+    
+    db = SyncSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+        
